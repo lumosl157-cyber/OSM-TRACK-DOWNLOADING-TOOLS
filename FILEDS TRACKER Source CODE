@@ -1,0 +1,562 @@
+import tkinter as tk  # 导入GUI界面的基础模块
+from tkinter import filedialog, messagebox, scrolledtext, ttk  # 导入文件对话框、消息提示框、滚动文本框及现代风格UI组件
+import threading  # 导入线程模块，用于将网络请求和UI渲染分离，防止界面假死
+import os  # 导入操作系统接口，用于路径处理和环境变量设置
+import time  # 导入时间模块，用于生成时间戳任务ID和控制限流休眠
+import requests  # 导入HTTP请求库，用于向Overpass API发送请求
+import geopandas as gpd  # 导入GeoPandas，用于处理地理空间数据帧(GeoDataFrame)
+import pandas as pd  # 导入Pandas，作为GeoPandas的底层数据结构支撑
+from shapely.geometry import Point, LineString, MultiLineString  # 导入Shapely，用于在内存中直接将坐标序列实例化为几何对象
+import warnings  # 导入警告控制模块
+import json  # 导入JSON解析模块，用于处理Overpass API返回的数据
+import re  # 导入正则表达式模块，通常用于字符串的复杂清洗（虽在此脚本直接调用较少，但作为备用）
+
+# 忽略所有的运行时警告，避免在控制台输出冗余的底层库警告信息
+warnings.filterwarnings("ignore")
+# 关闭GDAL的底层调试信息输出，防止干扰正常的控制台日志
+os.environ["CPL_DEBUG"] = "OFF"
+
+
+class QuickOSMJSONGeomApp:
+    def __init__(self, root):
+        # 绑定主窗口实例
+        self.root = root
+        # 设置窗口标题，标明版本和核心特性（宏观干线云端直读版）
+        self.root.title("OSM 极速提取器 ")
+        # 设置窗口初始大小
+        self.root.geometry("820x840")
+        # 设置窗口允许的最小尺寸，防止UI组件因挤压变形
+        self.root.minsize(750, 800)
+
+        # 定义Overpass API的服务器池，用于在遇到限流或宕机时进行轮询故障转移
+        self.server_pool = [
+            "https://lz4.overpass-api.de/api/interpreter",
+            "https://z.overpass-api.de/api/interpreter",
+            "https://overpass.kumi.systems/api/interpreter",
+            "https://overpass-api.de/api/interpreter"
+        ]
+        # 记录当前使用的服务器索引
+        self.current_server_idx = 0
+        # 状态标志，标识当前是否处于数据下载进程中
+        self.is_downloading = False
+        # 记录当前执行任务的唯一ID（通常使用时间戳），用于在用户点击“中止”时跨线程识别并中断任务
+        self.current_task_id = None
+        # 记录下载区域的总面积（以经纬度度数计算），用于计算总体进度
+        self.total_area = 0.0
+        # 记录已处理完成的区域面积
+        self.processed_area = 0.0
+
+        # 调用方法初始化所有的UI组件
+        self.create_widgets()
+
+    def create_widgets(self):
+        # --- 1. 范围输入区域 ---
+        # 创建一个LabelFrame容器用于包裹经纬度输入框
+        frame_bbox = tk.LabelFrame(self.root, text="1. 指定下载范围 (经纬度 WGS84)", padx=10, pady=10)
+        frame_bbox.pack(fill="x", padx=10, pady=5)  # 挂载到主窗口，横向填充
+
+        # 最小经度标签和输入框
+        tk.Label(frame_bbox, text="最小经度 (W):").grid(row=0, column=0, sticky="e")
+        self.entry_w = tk.Entry(frame_bbox, width=15)
+        self.entry_w.grid(row=0, column=1, padx=5, pady=2)
+
+        # 最大经度标签和输入框
+        tk.Label(frame_bbox, text="最大经度 (E):").grid(row=0, column=2, sticky="e")
+        self.entry_e = tk.Entry(frame_bbox, width=15)
+        self.entry_e.grid(row=0, column=3, padx=5, pady=2)
+
+        # 最小纬度标签和输入框
+        tk.Label(frame_bbox, text="最小纬度 (S):").grid(row=1, column=0, sticky="e")
+        self.entry_s = tk.Entry(frame_bbox, width=15)
+        self.entry_s.grid(row=1, column=1, padx=5, pady=2)
+
+        # 最大纬度标签和输入框
+        tk.Label(frame_bbox, text="最大纬度 (N):").grid(row=1, column=2, sticky="e")
+        self.entry_n = tk.Entry(frame_bbox, width=15)
+        self.entry_n.grid(row=1, column=3, padx=5, pady=2)
+
+        # 四叉树/云端网格运算控制开关变量
+        self.use_grid = tk.BooleanVar(value=True)
+        # 创建复选框用于控制是否启用四叉树递归切割
+        self.check_grid = tk.Checkbutton(frame_bbox, text="启用云端几何阵列运算 (专攻全国级边界/铁路/水系)",
+                                         variable=self.use_grid, fg="blue")
+        self.check_grid.grid(row=2, column=0, columnspan=4, sticky="w", pady=(5, 0))
+
+        # --- 2. 属性表筛选区域 ---
+        frame_tags = tk.LabelFrame(self.root, text="2. 属性表筛选指令", padx=10, pady=10)
+        frame_tags.pack(fill="x", padx=10, pady=5)
+
+        # OSM 主键输入框 (Key)
+        tk.Label(frame_tags, text="主键 Key (如 railway):").grid(row=0, column=0, sticky="e")
+        self.entry_key = tk.Entry(frame_tags, width=30)
+        self.entry_key.grid(row=0, column=1, padx=5, pady=2)
+
+        # OSM 属性值输入框 (Value)
+        tk.Label(frame_tags, text="属性 Value (可选, 如 rail):").grid(row=1, column=0, sticky="e")
+        self.entry_val = tk.Entry(frame_tags, width=30)
+        self.entry_val.grid(row=1, column=1, padx=5, pady=2)
+
+        # --- 3. 属性表清洗区域 ---
+        frame_fields = tk.LabelFrame(self.root, text="3. 属性表清洗", padx=10, pady=10)
+        frame_fields.pack(fill="x", padx=10, pady=5)
+
+        # 指定保留字段输入框
+        tk.Label(frame_fields, text="仅保留以下字段 (逗号分隔):").grid(row=0, column=0, sticky="e")
+        self.entry_keep_fields = tk.Entry(frame_fields, width=45)
+        self.entry_keep_fields.grid(row=0, column=1, padx=5, pady=2)
+
+        # --- 4. 网络设置区域 ---
+        frame_net = tk.LabelFrame(self.root, text="4. 网络设置", padx=10, pady=10)
+        frame_net.pack(fill="x", padx=10, pady=5)
+
+        # 服务器选择下拉框
+        self.server_combo = ttk.Combobox(frame_net, width=45, state="readonly")
+        self.server_combo['values'] = tuple(self.server_pool)  # 加载服务器列表
+        self.server_combo.current(0)  # 默认选中第一个服务器
+        self.server_combo.grid(row=0, column=0, columnspan=2, padx=5, pady=2)
+
+        # 代理启用开关及地址输入框
+        self.use_proxy = tk.BooleanVar(value=False)
+        self.check_proxy = tk.Checkbutton(frame_net, text="启用代理", variable=self.use_proxy)
+        self.check_proxy.grid(row=1, column=0, sticky="e")
+        self.entry_proxy = tk.Entry(frame_net, width=20)
+        self.entry_proxy.insert(0, "http://127.0.0.1:7890")  # 默认代理地址设为常用本地代理端口
+        self.entry_proxy.grid(row=1, column=1, padx=5, pady=2, sticky="w")
+
+        # --- 5. 导出设置区域 ---
+        frame_save = tk.LabelFrame(self.root, text="5. 导出设置", padx=10, pady=10)
+        frame_save.pack(fill="x", padx=10, pady=5)
+
+        # 存储路径字符串变量及只读输入框
+        self.save_path = tk.StringVar()
+        tk.Entry(frame_save, textvariable=self.save_path, width=45, state="readonly").grid(row=0, column=0, padx=5)
+        # 触发文件选择对话框的按钮
+        tk.Button(frame_save, text="选择保存位置", command=self.choose_save_file).grid(row=0, column=1, padx=5)
+
+        # --- 6. 状态及进度条区域 ---
+        frame_status = tk.Frame(self.root)
+        frame_status.pack(fill="x", padx=20, pady=5)
+
+        # 状态文本标签
+        self.lbl_prog = tk.Label(frame_status, text="状态: 待机", font=("Arial", 9, "bold"))
+        self.lbl_prog.pack(side="left")
+
+        # 确定模式的水平进度条
+        self.progress = ttk.Progressbar(frame_status, orient="horizontal", mode="determinate", length=400)
+        self.progress.pack(side="right", fill="x", expand=True, padx=(10, 0))
+
+        # --- 7. 控制按钮区域 ---
+        frame_btns = tk.Frame(self.root)
+        frame_btns.pack(pady=5, fill="x", padx=20)
+
+        # 启动任务按钮，绑定start_download方法
+        self.btn_run = tk.Button(frame_btns, text="▶ 执行云端拓扑抓取", bg="#4CAF50", fg="white",
+                                 font=("Arial", 12, "bold"), command=self.start_download)
+        self.btn_run.pack(side="left", fill="x", expand=True, padx=(0, 5))
+
+        # 中止任务按钮，初始状态为禁用，绑定stop_download方法
+        self.btn_stop = tk.Button(frame_btns, text="⏹ 中止任务", bg="#F44336", fg="white", font=("Arial", 12, "bold"),
+                                  state=tk.DISABLED, command=self.stop_download)
+        self.btn_stop.pack(side="right", fill="x", expand=True, padx=(5, 0))
+
+        # --- 8. 日志输出区域 ---
+        # 滚动文本框用于输出实时日志，设置为深色背景以提高可读性
+        self.log_area = scrolledtext.ScrolledText(self.root, height=15, state="disabled", bg="#1e1e1e", fg="#00ff00",
+                                                  font=("Consolas", 10))
+        self.log_area.pack(fill="both", padx=10, pady=5, expand=True)
+
+    def log(self, message):
+        """线程安全的日志记录方法。将信息追加到界面底部的文本框中。"""
+        self.log_area.config(state="normal")  # 临时解除只读状态
+        self.log_area.insert(tk.END, message + "\n")  # 插入最新日志到末尾
+        self.log_area.see(tk.END)  # 控制滚动条自动滚到底部
+        self.log_area.config(state="disabled")  # 恢复只读状态
+        self.root.update_idletasks()  # 强制刷新UI，确保在密集计算时日志能够实时显示
+
+    def choose_save_file(self):
+        """打开系统标准保存文件对话框，过滤受支持的空间数据格式。"""
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".gpkg",
+            filetypes=[("GeoPackage", "*.gpkg"), ("ESRI Shapefile", "*.shp"), ("GeoJSON", "*.geojson")],
+            title="选择保存格式"
+        )
+        if file_path:
+            self.save_path.set(file_path)  # 将用户选择的路径设置到字符串变量中
+
+    def stop_download(self):
+        """中止任务逻辑：通过将 current_task_id 置空，让所有正在运行的递归循环识别并主动退出。"""
+        self.current_task_id = None
+        self.log("终止指令已执行。")
+        self.btn_stop.config(state=tk.DISABLED, text="⏹ 中止任务")  # 禁用停止按钮
+        self.btn_run.config(state=tk.NORMAL, text="▶ 执行云端拓扑抓取")  # 恢复启动按钮
+        self.is_downloading = False
+        self.lbl_prog.config(text="状态: 中断")
+
+    def build_json_geom_query(self, s, w, n, e, key, val, timeout_val):
+        """构建Overpass QL（查询语言）字符串，利用 out geom 指令要求服务器直接返回几何体节点列表。"""
+        bbox = f"{s},{w},{n},{e}"
+        # 设置输出格式为json，并根据深度配置服务器端超时时间
+        query = f"[out:json][timeout:{timeout_val}];\n(\n"
+        if not key:
+            # 如果没有输入键值对，则抓取BBOX内所有节点、路径和关系
+            query += f"  node({bbox});\n  way({bbox});\n  relation({bbox});\n"
+        else:
+            if val:
+                # 键值对完全匹配过滤
+                query += f"  node[\"{key}\"=\"{val}\"]({bbox});\n  way[\"{key}\"=\"{val}\"]({bbox});\n  relation[\"{key}\"=\"{val}\"]({bbox});\n"
+            else:
+                # 仅键匹配过滤
+                query += f"  node[\"{key}\"]({bbox});\n  way[\"{key}\"]({bbox});\n  relation[\"{key}\"]({bbox});\n"
+        # 核心变动：强制输出云端组装几何序列 (out geom) 避免在本地进行复杂的参照解析
+        query += ");\nout geom;\n"
+        return query
+
+    def rotate_server(self):
+        """轮询切换Overpass服务器，作为容灾和应对HTTP 429请求频率限制的手段。"""
+        self.current_server_idx = (self.current_server_idx + 1) % len(self.server_pool)
+        return self.server_pool[self.current_server_idx]
+
+    def update_progress(self, block_area):
+        """更新网络请求阶段的进度条。通过当前处理的网格面积除以总面积计算百分比。"""
+        self.processed_area += block_area
+        # 防止浮点数精度问题导致进度超过1.0
+        progress_ratio = min(self.processed_area / self.total_area, 1.0)
+        # 网络获取阶段占据总进度的 60%
+        progress_val = int(progress_ratio * 60)
+        self.progress['value'] = progress_val
+        self.lbl_prog.config(text=f"状态: 网络获取 ({progress_val}%)")
+        self.root.update_idletasks()
+
+    def json_quadtree_drill(self, w, s, e, n, key, val, depth, task_id, cache_dir):
+        """
+        核心的四叉树递归抓取方法。
+        逻辑：当某个请求的区块数据量过大导致API报错时，将区块切分为四个象限，递归调用自身重新请求。
+        参数 depth 用于控制服务器超时时间和递归的物理限深。
+        """
+        # 如果任务ID变更，说明用户中止了任务，直接逐级返回空列表
+        if self.current_task_id != task_id: return []
+
+        block_area = (e - w) * (n - s)
+        needs_split = False  # 是否需要将当前区域切片的标志位
+
+        # 根据递归深度动态调整API超时时间，深度越深（区块越小），给服务器的容忍度越长
+        if depth == 0:
+            timeout_val = 60
+        elif depth == 1:
+            timeout_val = 180
+        elif depth == 2:
+            timeout_val = 400
+        else:
+            timeout_val = 900
+
+        # 获取生成的Overpass查询语句
+        query = self.build_json_geom_query(s, w, n, e, key, val, timeout_val)
+        # 本地请求库的超时时间需略大于服务器指定的超时时间，以防提前断开连接
+        req_timeout = timeout_val + 15
+
+        max_attempts = 4  # 当前区块最大重试次数
+        attempt = 0
+        while attempt < max_attempts:
+            if self.current_task_id != task_id: return []
+            endpoint = self.server_pool[self.current_server_idx]
+            attempt += 1
+
+            try:
+                # 配置代理字典
+                proxies = {'http': self.proxy, 'https': self.proxy} if self.proxy else None
+                # 发送 POST 请求获取 OSM 基础数据
+                resp = requests.post(endpoint, data=query, headers={'User-Agent': 'V39-JSON-Geom'}, proxies=proxies,
+                                     timeout=req_timeout)
+
+                # HTTP请求成功响应
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                    except json.JSONDecodeError:
+                        # 如果解析JSON失败且返回文本中包含 remark，通常是因为超时或数据超限，触发切片
+                        if "remark" in resp.text:
+                            needs_split = True
+                            break
+                        else:
+                            raise ValueError("JSON 畸形")
+
+                    # API 返回的有效负载中包含 remark 字段，通常意味着查询中止（如内存限制/超时）
+                    if "remark" in data:
+                        needs_split = True
+                        break
+
+                    # 如果数据为空集，直接跳过并更新进度
+                    elif not data.get("elements"):
+                        self.log(f"[深度 {depth}] 空集跳过。")
+                        self.update_progress(block_area)
+                        return []
+
+                    # 成功获取有效数据，写入缓存目录，并返回此JSON文件的路径
+                    else:
+                        temp_file = os.path.join(cache_dir, f"GEOM_Q{depth}_{int(time.time() * 1000)}.json")
+                        with open(temp_file, 'w', encoding='utf-8') as f:
+                            json.dump(data, f)
+                        self.log(f"[深度 {depth}] 几何实体落地 (跨度 {e - w:.2f}x{n - s:.2f}度)")
+                        self.update_progress(block_area)
+                        return [temp_file]
+
+                # HTTP 429 错误代表被限流
+                elif resp.status_code == 429 or "too many requests" in resp.text.lower() or "rate limit" in resp.text.lower():
+                    self.log(f"HTTP 429 限流挂起 60 秒。")
+                    time.sleep(60)  # 挂起线程等待限流恢复
+                    self.rotate_server()  # 切换到下一个服务器
+                    attempt = max(0, attempt - 1)  # 本次失败不计入错误重试次数
+                    continue
+
+                # 服务器内部错误或网关超时，触发网格切分
+                elif resp.status_code in [504, 502, 500, 503]:
+                    needs_split = True
+                    break
+
+                # 其他常规HTTP错误，切换服务器并在2秒后重试
+                else:
+                    self.rotate_server()
+                    time.sleep(2)
+
+            except Exception as e_req:
+                err_str = str(e_req).lower()
+                # 捕获连接断开或超时错误，触发网格切分逻辑
+                if "read" in err_str or "timeout" in err_str or "10054" in err_str or "aborted" in err_str:
+                    needs_split = True
+                    break
+                self.rotate_server()
+                time.sleep(2)
+
+        # 如果标记为需要分割，或到达最大重试次数仍失败，执行四叉树切割
+        if needs_split or attempt >= max_attempts:
+            # 防死循环机制：如果切分粒度小于 0.02 度，或递归深度超过12级，强制丢弃该网格
+            if (e - w) < 0.02 or depth > 12:
+                self.log(f"[深度 {depth}] 达物理限深，丢弃极微碎片。")
+                self.update_progress(block_area)
+                return []
+
+            # 计算网格中点
+            mid_w, mid_s = w + (e - w) / 2, s + (n - s) / 2
+            # 划分为四个象限：左下，右下，左上，右上
+            quads = [(w, s, mid_w, mid_s), (mid_w, s, e, mid_s), (w, mid_s, mid_w, n), (mid_w, mid_s, e, n)]
+            results = []
+            # 依次对四个象限进行递归调用
+            for qw, qs, qe, qn in quads:
+                time.sleep(1)  # 缓冲间隔，降低服务器压力
+                results.extend(self.json_quadtree_drill(qw, qs, qe, qn, key, val, depth + 1, task_id, cache_dir))
+            return results
+
+        return []
+
+    def start_download(self):
+        """校验输入参数并启动后台下载线程的方法。"""
+        try:
+            # 解析并验证经纬度类型
+            w, e, s, n = float(self.entry_w.get()), float(self.entry_e.get()), float(self.entry_s.get()), float(
+                self.entry_n.get())
+        except ValueError:
+            messagebox.showerror("错误", "坐标参数格式异常。")
+            return
+
+        # 获取标签及路径参数
+        key_input, val_input, keep_fields, out_path = self.entry_key.get().strip(), self.entry_val.get().strip(), self.entry_keep_fields.get().strip(), self.save_path.get().strip()
+
+        # 必须指定保存路径
+        if not out_path:
+            messagebox.showerror("错误", "目标存储路径为空。")
+            return
+
+        # 初始化任务状态
+        self.current_task_id = time.time()
+        self.btn_run.config(state=tk.DISABLED, text="执行中...")
+        self.btn_stop.config(state=tk.NORMAL, text="⏹ 中止任务")
+        self.is_downloading = True
+
+        # 重置进度计算所需的变量
+        self.total_area = (e - w) * (n - s)
+        self.processed_area = 0.0
+        self.progress['value'] = 0
+
+        # 清空日志面板
+        self.log_area.config(state="normal")
+        self.log_area.delete(1.0, tk.END)
+        self.log_area.config(state="disabled")
+        self.log("激活 Shapely 云端直读层，剥离 GDAL 本地依赖。")
+
+        # 启动后台守护线程执行核心管线，以保证GUI主线程持续响应
+        threading.Thread(target=self.core_pipeline, args=(
+            w, s, e, n, key_input, val_input, keep_fields, out_path, self.current_task_id), daemon=True).start()
+
+    def core_pipeline(self, w, s, e, n, key_input, val_input, keep_fields, out_path, task_id):
+        """
+        核心数据管线。在独立线程中执行，包含网络获取、JSON几何解析、去重以及本地文件导出过程。
+        """
+        # 读取代理配置
+        self.proxy = self.entry_proxy.get().strip() if self.use_proxy.get() else None
+
+        # 初始化缓存目录，用于存放网络上拉取的JSON分片文件
+        base_dir = os.path.dirname(out_path)
+        cache_dir = os.path.join(base_dir, "OSM_GEOM_Cache")
+        if not os.path.exists(cache_dir): os.makedirs(cache_dir)
+
+        json_files = []
+        # 进入递归入口：拉取所有几何分片文件路径
+        res_files = self.json_quadtree_drill(w, s, e, n, key_input, val_input, 0, task_id, cache_dir)
+        if res_files: json_files.extend(res_files)
+
+        # 检查是否为中止状态
+        if self.current_task_id != task_id: return
+
+        if not json_files:
+            self.log("网络检索终止：空间要素集为空。")
+            self.cleanup_and_reset(task_id, cache_dir, json_files)
+            return
+
+        self.log("调用 Shapely 执行原生几何实例化...")
+        try:
+            records = []
+            # 遍历并解析所有缓存的 JSON 分片文件
+            for idx, fp in enumerate(json_files):
+                if self.current_task_id != task_id: return
+                try:
+                    with open(fp, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+
+                    # 提取每一个 OSM 要素元素
+                    for el in data.get('elements', []):
+                        geom = None
+                        # 将点实体解析为 Shapely 的 Point 对象
+                        if el['type'] == 'node':
+                            geom = Point(el['lon'], el['lat'])
+
+                        # 将线实体解析为 Shapely 的 LineString 对象
+                        # 因为之前使用了 'out geom' 语句，此处的 way 包含了所有节点的 geometry 坐标列表
+                        elif el['type'] == 'way' and 'geometry' in el:
+                            coords = [(nd['lon'], nd['lat']) for nd in el['geometry']]
+                            if len(coords) >= 2: geom = LineString(coords)
+
+                        # 将关系(Relation)解析为 Shapely 的 MultiLineString 对象
+                        elif el['type'] == 'relation' and 'members' in el:
+                            lines = []
+                            for member in el['members']:
+                                # 筛选关系中含有几何坐标的way成员
+                                if member['type'] == 'way' and 'geometry' in member:
+                                    coords = [(nd['lon'], nd['lat']) for nd in member['geometry']]
+                                    if len(coords) >= 2: lines.append(LineString(coords))
+                            if lines: geom = MultiLineString(lines)
+
+                        # 如果几何对象成功实例化，将属性字典合并进来，构造一行数据
+                        if geom:
+                            row = {'osm_id': el['id'], 'osm_type': el['type'], 'geometry': geom}
+                            row.update(el.get('tags', {}))
+                            records.append(row)
+                except Exception:
+                    pass  # 静默忽略单文件解析错误，保障主体进程存活
+
+                # 更新后半程阶段进度条 (60% 到 90%)
+                self.progress['value'] = 60 + int(((idx + 1) / len(json_files)) * 30)
+                self.lbl_prog.config(text=f"状态: 几何转换 ({idx + 1}/{len(json_files)})")
+                self.root.update_idletasks()
+
+            if not records:
+                self.log("装配错误：可用实体解析量为零。")
+                self.cleanup_and_reset(task_id, cache_dir, json_files)
+                return
+
+            # 利用GeoPandas将字典记录列表转化为GeoDataFrame，声明坐标系为 WGS84 (EPSG:4326)
+            final_gdf = gpd.GeoDataFrame(records, geometry='geometry', crs="EPSG:4326")
+            self.log(f"实例化完成。原始对象总数：{len(final_gdf)}")
+
+        except Exception as e_parse:
+            self.log(f"解析装配栈异常: {e_parse}")
+            self.cleanup_and_reset(task_id, cache_dir, json_files)
+            return
+
+        self.log("执行拓扑全等强制降序去重。")
+
+        # 辅助计算列，用于记录实体的类型和WKT长度（长度即代表了几何节点的丰富度/完整度）
+        final_gdf['__geom_type'] = final_gdf.geometry.geom_type
+        final_gdf['__wkt_len'] = final_gdf.geometry.apply(lambda x: len(x.wkt))
+
+        # 核心去重逻辑：按osm_id、类型以及几何节点完整度（降序）排序，这样具有相同ID的碎片排在一起
+        final_gdf = final_gdf.sort_values(by=['osm_id', '__geom_type', '__wkt_len'], ascending=[True, True, False])
+        # 保留排在最前面的元素（即该ID对应的几何结构最完整的元素），删除由于网格分片重复下载产生的冗余边界
+        final_gdf = final_gdf.drop_duplicates(subset=['osm_id', '__geom_type'], keep='first').drop(
+            columns=['__geom_type', '__wkt_len'])
+
+        # 清洗列名：将OSM数据中含有的冒号替换为下划线，避免不同GIS格式导出时因字段名不支持导致崩溃
+        final_gdf.columns = [str(c).replace(':', '_') for c in final_gdf.columns]
+        # 去除重复的字段列
+        final_gdf = final_gdf.loc[:, ~final_gdf.columns.duplicated()]
+
+        # 如果用户指定了保留字段，在此过滤列
+        if keep_fields:
+            user_fields = [f.strip().replace(':', '_') for f in keep_fields.split(',') if f.strip()]
+            if 'geometry' not in user_fields: user_fields.append('geometry')  # 必须保留 geometry 字段
+            existing_fields = [f for f in user_fields if f in final_gdf.columns]
+            final_gdf = final_gdf[existing_fields]
+        else:
+            # 否则清理所有全部为空值的无意义列
+            final_gdf.dropna(axis=1, how='all', inplace=True)
+
+        # 遍历字符类型列，清理换行符、制表符等非法控制符，并将空字符串替换为标准的 None 空值
+        for col in final_gdf.columns:
+            if col != 'geometry' and final_gdf[col].dtype == object:
+                mask = final_gdf[col].notna()
+                final_gdf.loc[mask, col] = final_gdf.loc[mask, col].astype(str).str.replace(r'[\r\n\t]', ' ',
+                                                                                            regex=True)
+                final_gdf[col] = final_gdf[col].replace({'None': None, 'nan': None, '<NA>': None, '': None})
+
+        # --- 数据导出层 ---
+        ext = os.path.splitext(out_path)[1].lower()  # 获取目标文件后缀
+        try:
+            if ext == '.shp':
+                # ESRI Shapefile 不支持在同一文件中混合不同类型的几何体，故按类型拆分输出
+                base_path = os.path.splitext(out_path)[0]
+                points = final_gdf[final_gdf.geom_type.isin(['Point', 'MultiPoint'])]
+                lines = final_gdf[final_gdf.geom_type.isin(['LineString', 'MultiLineString'])]
+                polys = final_gdf[final_gdf.geom_type.isin(['Polygon', 'MultiPolygon'])]
+
+                # 分别导出文件
+                if not points.empty: points.to_file(f"{base_path}_points.shp", driver='ESRI Shapefile',
+                                                    encoding='utf-8')
+                if not lines.empty: lines.to_file(f"{base_path}_lines.shp", driver='ESRI Shapefile', encoding='utf-8')
+                if not polys.empty: polys.to_file(f"{base_path}_polygons.shp", driver='ESRI Shapefile',
+                                                  encoding='utf-8')
+            elif ext == '.gpkg':
+                # GeoPackage支持混合存储，直接输出即可
+                final_gdf.to_file(out_path, driver='GPKG', encoding='utf-8')
+            elif ext == '.geojson':
+                # GeoJSON 同样支持混合存储
+                final_gdf.to_file(out_path, driver='GeoJSON', encoding='utf-8')
+
+            self.log(f"数据固化结束。有效实体输出量：{len(final_gdf)}。")
+            messagebox.showinfo("状态确认", "执行流正常结束。已绕过 GDAL 阻断机制。")
+        except Exception as e_save:
+            self.log(f"I/O 存储越权: {e_save}")  # 捕获如文件被占用等I/O错误
+
+        # 最终调用清理函数，清空缓存状态
+        self.cleanup_and_reset(task_id, cache_dir, json_files)
+
+    def cleanup_and_reset(self, task_id, cache_dir, json_files):
+        """执行环境清理。删除所有由于下载产生的中间JSON缓存文件，并重置UI界面的按钮和进度状态。"""
+        if self.current_task_id == task_id:
+            try:
+                # 遍历并强制移除所有JSON临时缓存
+                for f in json_files:
+                    if os.path.exists(f): os.remove(f)
+            except:
+                pass  # 忽略由于权限原因无法删除的个例
+            # 还原UI按钮初始状态
+            self.btn_run.config(state=tk.NORMAL, text="▶ 执行云端拓扑抓取")
+            self.btn_stop.config(state=tk.DISABLED, text="⏹ 中止任务")
+            self.is_downloading = False
+            self.lbl_prog.config(text="状态: 待机")
+            self.progress['value'] = 100
+
+
+# 标准主程序执行入口
+if __name__ == "__main__":
+    root = tk.Tk()  # 初始化tkinter底板
+    app = QuickOSMJSONGeomApp(root)  # 将底板载入自定义GUI类
+    root.mainloop()  # 激活主消息循环，维持窗口呈现
